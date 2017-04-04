@@ -38,6 +38,8 @@ import (
     "gopkg.in/olivere/elastic.v5"
     "errors"
     "context"
+    "time"
+    //"encoding/json"
 )
 
 // A single result which comes from an individual web
@@ -49,22 +51,17 @@ type Result struct {
 	Size   *int64
     Body   []byte
 }
-//const (  
-//    indexName    = "applications"
-//    docType      = "log"
-//    appName      = "myApp"
-//    indexMapping = `{
-//                        "mappings" : {
-//                            "log" : {
-//                                "properties" : {
-//                                    "app" : { "type" : "string", "index" : "not_analyzed" },
-//                                    "message" : { "type" : "string", "index" : "not_analyzed" },
-//                                    "time" : { "type" : "date" }
-//                                }
-//                            }
-//                        }
-//                    }`
-//)
+
+//htmldocument is a structure used to serialize an html result 
+type htmldocument struct {
+    Domain  string      `json:"domain"`
+    IP      string      `json:"ip"` 
+    URL     string      `json:"url"`
+    Header  string      `json:"header"`
+    Body    string      `json:"body"`
+    Created time.Time   `json:"created"`
+}
+
 
 type PrintResultFunc func(s *State, r *Result)
 type ProcessorFunc func(s *State, entity string, resultChan chan<- Result)
@@ -119,6 +116,8 @@ type State struct {
 	StdIn          bool
 	InsecureSSL    bool
     UseElasticSearch    bool
+    ESIndexName     string
+    ESCampaign      string
     ElasticSearchIP     string
     ElasticSearchPort   string
     ElasticSearch       *elastic.Client
@@ -295,9 +294,11 @@ func ParseCmdLine() *State {
 	flag.BoolVar(&s.WildcardForced, "fw", false, "Force continued operation when wildcard found")
 	flag.BoolVar(&s.InsecureSSL, "k", false, "Skip SSL certificate verification")
     flag.BoolVar(&s.UseElasticSearch, "es", false, "Save results to elastic search")
+    flag.StringVar(&s.ESIndexName, "esidx", "bugbounty", "Name of index to use in ElasticSearch") 
+    flag.StringVar(&s.ESCampaign, "escampaign", "", "Name of campaign to use in ElasticSearch") 
     flag.StringVar(&s.ElasticSearchIP, "esh", "127.0.0.1", "ElasticSearch IP")
-    flag.StringVar(&s.ElasticSearchPort, "esp", "5900", "ElasticSearch port")
-	flag.Parse()
+    flag.StringVar(&s.ElasticSearchPort, "esp", "9200", "ElasticSearch port")
+    flag.Parse()
 
 	Banner(&s)
 
@@ -446,38 +447,40 @@ func ParseCmdLine() *State {
 		}
 	}
     if s.UseElasticSearch {
-           //ElasticSearchConnection := fmt.Sprintf("http://%s:%s", s.ElasticSearchIP, s.ElasticSearchPort) 
-           //s.ElasticSearch, err = elastic.NewClient(elastic.SetURL(ElasticSearchConnection))
+           ElasticSearchConnection := fmt.Sprintf("http://%s:%s", s.ElasticSearchIP, s.ElasticSearchPort) 
+           s.ElasticSearch, err = elastic.NewClient(elastic.SetURL(ElasticSearchConnection))
            //s.ElasticSearch, err = elastic.NewClient(elastic.SetURL("http://127.0.0.1:5601"))
-           s.ElasticSearch, err = elastic.NewClient()
+           //s.ElasticSearch, err = elastic.NewClient()
             if err != nil {
                     fmt.Println(s.ElasticSearchIP, s.ElasticSearchPort)
-                
                     panic(err) 
             }
-            //create the index
-            //indexName :=  s.Url 
-            //docType := "html"
-             
-            indexMapping := `{
-                        "mappings" : {
-                            "html" : {
-                                "properties" : {
-                                    "url" : { "type" : "string", "index" : "not_analyzed" },
-                                    "header" : { "type" : "string"},
-                                    "body" : { "type" : "string"},
-                                    "time" : { "type" : "date" }
-                                }
-                            }
-                        }
-                    }`
-            var urlstrip := regexp.MustCompile(`^https?:\/\/(.*)`
-            currenturl := urlstrip.FindStringSubmatch(s.Url)[1] //get everything after http
-            exists, err  := s.ElasticSearch.IndexExists(s.Url).Do(context.Background())
+            if s.ESIndexName == "" {
+                    fmt.Println("Elasticsearch index must be entered")
+                    panic(err)
+            }
+            if s.ESCampaign == "" {
+                    fmt.Println("Elasticsearch campaign name must be entered")
+                    panic(err)
+            }
+            indexName := s.ESIndexName 
+            campaign := s.ESCampaign
+           // Create a new index.
+            mapping := `{
+                "settings":{
+                    "number_of_shards":1,
+                    "number_of_replicas":0
+                },
+                "mappings":{
+                    "`+campaign+`":{
+                    }
+                }
+            }` 
+                        exists, err  := s.ElasticSearch.IndexExists(indexName).Do(context.Background())
             if err == nil {
                 if !exists {
-                        res, err2 := s.ElasticSearch.CreateIndex(s.Url).
-                                Body(indexMapping).
+                        res, err2 := s.ElasticSearch.CreateIndex(indexName).
+                                Body(mapping).
                                         Do(context.Background())
                         if err2 != nil {
                         }
@@ -776,6 +779,10 @@ func WriteToFile(output string, s *State) {
 }
 
 func ElasticDirFunc(s *State, r *Result) {
+        var urlstrip := regexp.MustCompile(`^https?:\/\/(.*)`
+        currenturl := urlstrip.FindStringSubmatch(s.Url)[1] //get everything after http
+
+        entry := htmldocument{
         //l:  LogThing {
         //l:      Url:    s.Url,
         //l:      Header: 
