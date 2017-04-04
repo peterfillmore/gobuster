@@ -35,6 +35,9 @@ import (
 	"sync"
 	"syscall"
 	"unicode/utf8"
+    "gopkg.in/olivere/elastic.v5"
+    "errors"
+    "context"
 )
 
 // A single result which comes from an individual web
@@ -44,11 +47,29 @@ type Result struct {
 	Status int
 	Extra  string
 	Size   *int64
+    Body   []byte
 }
+//const (  
+//    indexName    = "applications"
+//    docType      = "log"
+//    appName      = "myApp"
+//    indexMapping = `{
+//                        "mappings" : {
+//                            "log" : {
+//                                "properties" : {
+//                                    "app" : { "type" : "string", "index" : "not_analyzed" },
+//                                    "message" : { "type" : "string", "index" : "not_analyzed" },
+//                                    "time" : { "type" : "date" }
+//                                }
+//                            }
+//                        }
+//                    }`
+//)
 
 type PrintResultFunc func(s *State, r *Result)
 type ProcessorFunc func(s *State, entity string, resultChan chan<- Result)
 type SetupFunc func(s *State) bool
+type ElasticFunc func(s *State, r *Result)
 
 // Shim type for "set" containing ints
 type IntSet struct {
@@ -74,7 +95,8 @@ type State struct {
 	Password       string
 	Printer        PrintResultFunc
 	Processor      ProcessorFunc
-	ProxyUrl       *url.URL
+    ElasticWriter  ElasticFunc	
+    ProxyUrl       *url.URL
 	Quiet          bool
 	Setup          SetupFunc
 	ShowIPs        bool
@@ -96,6 +118,10 @@ type State struct {
 	Terminate      bool
 	StdIn          bool
 	InsecureSSL    bool
+    UseElasticSearch    bool
+    ElasticSearchIP     string
+    ElasticSearchPort   string
+    ElasticSearch       *elastic.Client
 }
 
 type RedirectHandler struct {
@@ -169,11 +195,11 @@ func (set *IntSet) Stringify() string {
 }
 
 // Make a request to the given URL.
-func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64) {
+func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64, []byte) {
 	req, err := http.NewRequest("GET", fullUrl, nil)
 
-	if err != nil {
-		return nil, nil
+    if err != nil {
+		return nil, nil, nil
 	}
 
 	if cookie != "" {
@@ -189,7 +215,6 @@ func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64) {
 	}
 
 	resp, err := s.Client.Do(req)
-
 	if err != nil {
 		if ue, ok := err.(*url.Error); ok {
 
@@ -198,34 +223,35 @@ func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64) {
 			}
 
 			if re, ok := ue.Err.(*RedirectError); ok {
-				return &re.StatusCode, nil
+				return &re.StatusCode, nil, nil
 			}
 		}
-		return nil, nil
+		return nil, nil,nil
 	}
 
 	defer resp.Body.Close()
 
 	var length *int64 = nil
+    //var Body []byte = nil
+	Body, err := ioutil.ReadAll(resp.Body)
 
 	if s.IncludeLength {
 		length = new(int64)
 		if resp.ContentLength <= 0 {
-			body, err := ioutil.ReadAll(resp.Body)
 			if err == nil {
-				*length = int64(utf8.RuneCountInString(string(body)))
+				*length = int64(utf8.RuneCountInString(string(Body)))
 			}
 		} else {
 			*length = resp.ContentLength
 		}
 	}
 
-	return &resp.StatusCode, length
+	return &resp.StatusCode, length, Body
 }
 
 // Small helper to combine URL with URI then make a
 // request to the generated location.
-func GoGet(s *State, url, uri, cookie string) (*int, *int64) {
+func GoGet(s *State, url, uri, cookie string) (*int, *int64, []byte) {
 	return MakeRequest(s, url+uri, cookie)
 }
 
@@ -268,7 +294,9 @@ func ParseCmdLine() *State {
 	flag.BoolVar(&s.UseSlash, "f", false, "Append a forward-slash to each directory request (dir mode only)")
 	flag.BoolVar(&s.WildcardForced, "fw", false, "Force continued operation when wildcard found")
 	flag.BoolVar(&s.InsecureSSL, "k", false, "Skip SSL certificate verification")
-
+    flag.BoolVar(&s.UseElasticSearch, "es", false, "Save results to elastic search")
+    flag.StringVar(&s.ElasticSearchIP, "esh", "127.0.0.1", "ElasticSearch IP")
+    flag.StringVar(&s.ElasticSearchPort, "esp", "5900", "ElasticSearch port")
 	flag.Parse()
 
 	Banner(&s)
@@ -277,6 +305,7 @@ func ParseCmdLine() *State {
 	case "dir":
 		s.Printer = PrintDirResult
 		s.Processor = ProcessDirEntry
+        s.ElasticWriter = ElasticDirFunc
 		s.Setup = SetupDir
 	case "dns":
 		s.Printer = PrintDnsResult
@@ -407,7 +436,7 @@ func ParseCmdLine() *State {
 					},
 				}}
 
-			code, _ := GoGet(&s, s.Url, "", s.Cookies)
+			code, _, _ := GoGet(&s, s.Url, "", s.Cookies)
 			if code == nil {
 				fmt.Println("[-] Unable to connect:", s.Url)
 				valid = false
@@ -416,7 +445,52 @@ func ParseCmdLine() *State {
 			Ruler(&s)
 		}
 	}
+    if s.UseElasticSearch {
+           //ElasticSearchConnection := fmt.Sprintf("http://%s:%s", s.ElasticSearchIP, s.ElasticSearchPort) 
+           //s.ElasticSearch, err = elastic.NewClient(elastic.SetURL(ElasticSearchConnection))
+           //s.ElasticSearch, err = elastic.NewClient(elastic.SetURL("http://127.0.0.1:5601"))
+           s.ElasticSearch, err = elastic.NewClient()
+            if err != nil {
+                    fmt.Println(s.ElasticSearchIP, s.ElasticSearchPort)
+                
+                    panic(err) 
+            }
+            //create the index
+            //indexName :=  s.Url 
+            //docType := "html"
+             
+            indexMapping := `{
+                        "mappings" : {
+                            "html" : {
+                                "properties" : {
+                                    "url" : { "type" : "string", "index" : "not_analyzed" },
+                                    "header" : { "type" : "string"},
+                                    "body" : { "type" : "string"},
+                                    "time" : { "type" : "date" }
+                                }
+                            }
+                        }
+                    }`
+            var urlstrip := regexp.MustCompile(`^https?:\/\/(.*)`
+            currenturl := urlstrip.FindStringSubmatch(s.Url)[1] //get everything after http
+            exists, err  := s.ElasticSearch.IndexExists(s.Url).Do(context.Background())
+            if err == nil {
+                if !exists {
+                        res, err2 := s.ElasticSearch.CreateIndex(s.Url).
+                                Body(indexMapping).
+                                        Do(context.Background())
+                        if err2 != nil {
+                        }
+                        if !res.Acknowledged {
+                            errors.New("CreateIndex was not acknowledged. Check that timeout value is correct.")
+                        }
 
+                }
+        } else {
+        panic(err)     
+        }
+
+    }
 	if valid {
 		return &s
 	}
@@ -447,6 +521,8 @@ func Process(s *State) {
 	processorGroup.Add(s.Threads)
 	printerGroup := new(sync.WaitGroup)
 	printerGroup.Add(1)
+    elasticGroup := new(sync.WaitGroup)
+    elasticGroup.Add(1)
 
 	// Create goroutines for each of the number of threads
 	// specified.
@@ -475,10 +551,12 @@ func Process(s *State) {
 	go func() {
 		for r := range resultChan {
 			s.Printer(s, &r)
+            s.ElasticWriter(s, &r)
 		}
 		printerGroup.Done()
+        elasticGroup.Done()
 	}()
-
+    
 	var scanner *bufio.Scanner
 
 	if s.StdIn {
@@ -524,7 +602,8 @@ func Process(s *State) {
 	processorGroup.Wait()
 	close(resultChan)
 	printerGroup.Wait()
-	if s.OutputFile != nil {
+    elasticGroup.Wait()	
+    if s.OutputFile != nil {
 		outputFile.Close()
 	}
 	Ruler(s)
@@ -558,7 +637,7 @@ func SetupDns(s *State) bool {
 
 func SetupDir(s *State) bool {
 	guid := uuid.NewV4()
-	wildcardResp, _ := GoGet(s, s.Url, fmt.Sprintf("%s", guid), s.Cookies)
+	wildcardResp, _, _ := GoGet(s, s.Url, fmt.Sprintf("%s", guid), s.Cookies)
 
 	if s.StatusCodes.Contains(*wildcardResp) {
 		s.IsWildcard = true
@@ -607,25 +686,27 @@ func ProcessDirEntry(s *State, word string, resultChan chan<- Result) {
 	}
 
 	// Try the DIR first
-	dirResp, dirSize := GoGet(s, s.Url, word+suffix, s.Cookies)
+	dirResp, dirSize, body := GoGet(s, s.Url, word+suffix, s.Cookies)
 	if dirResp != nil {
 		resultChan <- Result{
 			Entity: word + suffix,
 			Status: *dirResp,
 			Size:   dirSize,
+            Body:  body, 
 		}
 	}
 
 	// Follow up with files using each ext.
 	for ext := range s.Extensions {
 		file := word + s.Extensions[ext]
-		fileResp, fileSize := GoGet(s, s.Url, file, s.Cookies)
+		fileResp, fileSize, body := GoGet(s, s.Url, file, s.Cookies)
 
 		if fileResp != nil {
 			resultChan <- Result{
 				Entity: file,
 				Status: *fileResp,
 				Size:   fileSize,
+                Body:   body,
 			}
 		}
 	}
@@ -676,8 +757,9 @@ func PrintDirResult(s *State, r *Result) {
 		if r.Size != nil {
 			output += fmt.Sprintf(" [Size: %d]", *r.Size)
 		}
-		output += "\n"
 
+        output += "\n"
+        
 		fmt.Printf(output)
 
 		if s.OutputFile != nil {
@@ -693,6 +775,11 @@ func WriteToFile(output string, s *State) {
 	}
 }
 
+func ElasticDirFunc(s *State, r *Result) {
+        //l:  LogThing {
+        //l:      Url:    s.Url,
+        //l:      Header: 
+}
 func PrepareSignalHandler(s *State) {
 	s.SignalChan = make(chan os.Signal, 1)
 	signal.Notify(s.SignalChan, os.Interrupt)
