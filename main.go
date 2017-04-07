@@ -39,7 +39,7 @@ import (
     "errors"
     "context"
     "time"
-    //"encoding/json"
+    "encoding/json"
 )
 
 // A single result which comes from an individual web
@@ -49,14 +49,16 @@ type Result struct {
 	Status int
 	Extra  string
 	Size   *int64
+    Header http.Header
     Body   []byte
 }
 
 //htmldocument is a structure used to serialize an html result 
 type htmldocument struct {
     Domain  string      `json:"domain"`
-    IP      string      `json:"ip"` 
+    IP      []string      `json:"ip"` 
     URL     string      `json:"url"`
+    Status  int         `json:"status"`
     Header  string      `json:"header"`
     Body    string      `json:"body"`
     Created time.Time   `json:"created"`
@@ -194,11 +196,11 @@ func (set *IntSet) Stringify() string {
 }
 
 // Make a request to the given URL.
-func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64, []byte) {
+func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64, []byte, http.Header) {
 	req, err := http.NewRequest("GET", fullUrl, nil)
 
     if err != nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	if cookie != "" {
@@ -222,10 +224,10 @@ func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64, []byte) {
 			}
 
 			if re, ok := ue.Err.(*RedirectError); ok {
-				return &re.StatusCode, nil, nil
+				return &re.StatusCode, nil, nil, nil
 			}
 		}
-		return nil, nil,nil
+		return nil, nil,nil, nil
 	}
 
 	defer resp.Body.Close()
@@ -245,12 +247,12 @@ func MakeRequest(s *State, fullUrl, cookie string) (*int, *int64, []byte) {
 		}
 	}
 
-	return &resp.StatusCode, length, Body
+	return &resp.StatusCode, length, Body, resp.Header
 }
 
 // Small helper to combine URL with URI then make a
 // request to the generated location.
-func GoGet(s *State, url, uri, cookie string) (*int, *int64, []byte) {
+func GoGet(s *State, url, uri, cookie string) (*int, *int64, []byte, http.Header) {
 	return MakeRequest(s, url+uri, cookie)
 }
 
@@ -294,7 +296,7 @@ func ParseCmdLine() *State {
 	flag.BoolVar(&s.WildcardForced, "fw", false, "Force continued operation when wildcard found")
 	flag.BoolVar(&s.InsecureSSL, "k", false, "Skip SSL certificate verification")
     flag.BoolVar(&s.UseElasticSearch, "es", false, "Save results to elastic search")
-    flag.StringVar(&s.ESIndexName, "esidx", "bugbounty", "Name of index to use in ElasticSearch") 
+    flag.StringVar(&s.ESIndexName, "esidx", "bugbounty", "Name of index to use in ElasticSearch (default to bugbounty)") 
     flag.StringVar(&s.ESCampaign, "escampaign", "", "Name of campaign to use in ElasticSearch") 
     flag.StringVar(&s.ElasticSearchIP, "esh", "127.0.0.1", "ElasticSearch IP")
     flag.StringVar(&s.ElasticSearchPort, "esp", "9200", "ElasticSearch port")
@@ -437,7 +439,7 @@ func ParseCmdLine() *State {
 					},
 				}}
 
-			code, _, _ := GoGet(&s, s.Url, "", s.Cookies)
+			code, _, _, _ := GoGet(&s, s.Url, "", s.Cookies)
 			if code == nil {
 				fmt.Println("[-] Unable to connect:", s.Url)
 				valid = false
@@ -490,7 +492,7 @@ func ParseCmdLine() *State {
 
                 }
         } else {
-        panic(err)     
+            panic(err)     
         }
 
     }
@@ -640,7 +642,7 @@ func SetupDns(s *State) bool {
 
 func SetupDir(s *State) bool {
 	guid := uuid.NewV4()
-	wildcardResp, _, _ := GoGet(s, s.Url, fmt.Sprintf("%s", guid), s.Cookies)
+	wildcardResp, _, _, _ := GoGet(s, s.Url, fmt.Sprintf("%s", guid), s.Cookies)
 
 	if s.StatusCodes.Contains(*wildcardResp) {
 		s.IsWildcard = true
@@ -689,12 +691,13 @@ func ProcessDirEntry(s *State, word string, resultChan chan<- Result) {
 	}
 
 	// Try the DIR first
-	dirResp, dirSize, body := GoGet(s, s.Url, word+suffix, s.Cookies)
+	dirResp, dirSize, body, header := GoGet(s, s.Url, word+suffix, s.Cookies)
 	if dirResp != nil {
 		resultChan <- Result{
 			Entity: word + suffix,
 			Status: *dirResp,
 			Size:   dirSize,
+            Header: header,
             Body:  body, 
 		}
 	}
@@ -702,13 +705,14 @@ func ProcessDirEntry(s *State, word string, resultChan chan<- Result) {
 	// Follow up with files using each ext.
 	for ext := range s.Extensions {
 		file := word + s.Extensions[ext]
-		fileResp, fileSize, body := GoGet(s, s.Url, file, s.Cookies)
+		fileResp, fileSize, body, header := GoGet(s, s.Url, file, s.Cookies)
 
 		if fileResp != nil {
 			resultChan <- Result{
 				Entity: file,
 				Status: *fileResp,
 				Size:   fileSize,
+                Header: header, 
                 Body:   body,
 			}
 		}
@@ -778,14 +782,45 @@ func WriteToFile(output string, s *State) {
 	}
 }
 
-func ElasticDirFunc(s *State, r *Result) {
-        var urlstrip := regexp.MustCompile(`^https?:\/\/(.*)`
-        currenturl := urlstrip.FindStringSubmatch(s.Url)[1] //get everything after http
+//convert header into a json struct
+func ProcessHeader(header http.Header) []byte{
+    var jsoninterface interface{} = header 
+    jsonheader, err := json.Marshal(jsoninterface)
+    if(err != nil){
+            panic(err)
+    }
+    return jsonheader 
+}
 
+
+func ElasticDirFunc(s *State, r *Result) {
+    if s.StatusCodes.Contains(r.Status){ 
+        //get current host 
+        var hoststrip = regexp.MustCompile(`^(?:https?:\/\/)?(?:[^@\n]+@)?([^:\/\n]+)`)
+        currenthost := hoststrip.FindStringSubmatch(s.Url)[1] //get everything after http
+        jsonheader := ProcessHeader(r.Header) 
+        currentIP,err :=  net.LookupHost(currenthost)
         entry := htmldocument{
-        //l:  LogThing {
-        //l:      Url:    s.Url,
-        //l:      Header: 
+            Domain: currenthost,
+            IP: currentIP,
+            URL:  s.Url,
+            Status: r.Status, 
+            Header: string(jsonheader),
+            Body: string(r.Body),
+            Created: time.Now(),
+        }
+        put1, err := s.ElasticSearch.Index().
+            Index(s.ESIndexName).
+            Type(s.ESCampaign).
+            //Id("1").
+            BodyJson(entry).
+            Do(context.Background())
+       if err != nil {
+               panic(err)
+       }
+       fmt.Printf("Indexed tweet %s to index %s, type %s\n", put1.Id, put1.Index, put1.Type)
+
+    }
 }
 func PrepareSignalHandler(s *State) {
 	s.SignalChan = make(chan os.Signal, 1)
